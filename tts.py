@@ -3,30 +3,27 @@ import requests
 from bs4 import BeautifulSoup
 from gtts import gTTS
 import tempfile
-import os
 
-st.set_page_config(page_title="Text/URL to WAV", layout="centered")
+st.set_page_config(page_title="Text/URL to MP3", layout="centered")
 
-st.title("Text or URL to WAV Converter")
+st.title("Text or URL to MP3 Converter")
 
-# Input mode
+# Input selection
 option = st.radio("Choose input type:", ["Paste Text", "Enter URL"])
 
 text_content = ""
 
-# Get text input
 if option == "Paste Text":
     text_content = st.text_area("Paste your text here:", height=250)
 
 elif option == "Enter URL":
     url = st.text_input("Enter URL:")
-
     if url:
         try:
             response = requests.get(url, timeout=10)
             soup = BeautifulSoup(response.text, "html.parser")
 
-            # Remove scripts and styles
+            # Remove scripts/styles
             for tag in soup(["script", "style"]):
                 tag.extract()
 
@@ -38,39 +35,31 @@ elif option == "Enter URL":
         except Exception as e:
             st.error(f"Error fetching URL: {e}")
 
-# Convert to WAV
-if st.button("Convert to WAV"):
+# Convert to MP3
+if st.button("Convert to MP3"):
     if not text_content.strip():
         st.warning("Please provide text or a valid URL.")
     else:
         try:
-            with st.spinner("Generating audio..."):
+            with st.spinner("Generating MP3..."):
                 tts = gTTS(text=text_content, lang="en")
 
-                # Save temporarily as mp3 (gTTS default)
                 tmp_mp3 = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
                 tts.save(tmp_mp3.name)
 
-                # Convert mp3 to wav
-                from pydub import AudioSegment
-                sound = AudioSegment.from_mp3(tmp_mp3.name)
-
-                tmp_wav = tempfile.NamedTemporaryFile(delete=False, suffix=".wav")
-                sound.export(tmp_wav.name, format="wav")
+                st.success("Audio generated successfully!")
 
                 # Play audio
-                st.audio(tmp_wav.name, format="audio/wav")
+                st.audio(tmp_mp3.name, format="audio/mp3")
 
                 # Download button
-                with open(tmp_wav.name, "rb") as f:
+                with open(tmp_mp3.name, "rb") as f:
                     st.download_button(
-                        label="Download WAV",
+                        label="Download MP3",
                         data=f,
-                        file_name="output.wav",
-                        mime="audio/wav"
+                        file_name="output.mp3",
+                        mime="audio/mpeg"
                     )
-
-                os.unlink(tmp_mp3.name)
 
         except Exception as e:
             st.error(f"Error generating audio: {e}")
