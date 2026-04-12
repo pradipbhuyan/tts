@@ -78,60 +78,101 @@ if text_content.strip():
 
 # ------------------ GENERATION ------------------
 
+import time
+
 if text_content.strip() and "confirm" in locals() and confirm:
 
     if st.button("Generate Audio Files"):
 
         try:
-            with st.spinner("Generating audio files..."):
+            words = text_content.split()
+            words_per_file = WORDS_PER_MINUTE * MAX_MINUTES_PER_FILE
 
-                words = text_content.split()
-                words_per_file = WORDS_PER_MINUTE * MAX_MINUTES_PER_FILE
+            file_chunks = [
+                " ".join(words[i:i + words_per_file])
+                for i in range(0, len(words), words_per_file)
+            ]
 
-                file_chunks = [
-                    " ".join(words[i:i + words_per_file])
-                    for i in range(0, len(words), words_per_file)
+            # Count total API chunks for progress calculation
+            total_api_chunks = 0
+            api_structure = []
+
+            for chunk in file_chunks:
+                api_chunks = [
+                    chunk[i:i + 4000]
+                    for i in range(0, len(chunk), 4000)
                 ]
+                api_structure.append(api_chunks)
+                total_api_chunks += len(api_chunks)
 
-                generated_files = []
+            progress_bar = st.progress(0)
+            status_text = st.empty()
+            eta_text = st.empty()
 
-                for idx, chunk in enumerate(file_chunks):
+            completed_chunks = 0
+            start_time = time.time()
 
-                    # Further safe chunking for API (~4000 chars)
-                    api_chunks = [
-                        chunk[i:i + 4000]
-                        for i in range(0, len(chunk), 4000)
-                    ]
+            generated_files = []
 
-                    final_audio = b""
+            for file_index, api_chunks in enumerate(api_structure):
 
-                    for part in api_chunks:
-                        response = client.audio.speech.create(
-                            model=MODEL_NAME,
-                            voice=VOICE,
-                            input=part
-                        )
-                        final_audio += response.content
+                final_audio = b""
 
-                    tmp_mp3 = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
-                    tmp_mp3.write(final_audio)
-                    tmp_mp3.close()
+                for part in api_chunks:
 
-                    generated_files.append((idx + 1, tmp_mp3.name))
+                    chunk_start = time.time()
 
-                st.success("✅ Audio files generated successfully!")
+                    response = client.audio.speech.create(
+                        model=MODEL_NAME,
+                        voice=VOICE,
+                        input=part
+                    )
 
-                for file_number, file_path in generated_files:
-                    st.markdown(f"### 🎧 Part {file_number}")
-                    st.audio(file_path, format="audio/mp3")
+                    final_audio += response.content
+                    completed_chunks += 1
 
-                    with open(file_path, "rb") as f:
-                        st.download_button(
-                            label=f"Download Part {file_number}",
-                            data=f,
-                            file_name=f"output_part_{file_number}.mp3",
-                            mime="audio/mpeg"
-                        )
+                    # ---- Progress Calculation ----
+                    progress = completed_chunks / total_api_chunks
+                    progress_bar.progress(progress)
+
+                    elapsed = time.time() - start_time
+                    avg_time_per_chunk = elapsed / completed_chunks
+                    remaining_chunks = total_api_chunks - completed_chunks
+                    eta_seconds = avg_time_per_chunk * remaining_chunks
+
+                    eta_minutes = eta_seconds / 60
+
+                    status_text.markdown(
+                        f"**Generating File {file_index + 1}...** "
+                        f"({completed_chunks}/{total_api_chunks} chunks)"
+                    )
+
+                    eta_text.markdown(
+                        f"⏳ Estimated time remaining: {eta_minutes:.1f} minutes"
+                    )
+
+                tmp_mp3 = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
+                tmp_mp3.write(final_audio)
+                tmp_mp3.close()
+
+                generated_files.append((file_index + 1, tmp_mp3.name))
+
+            progress_bar.progress(1.0)
+            status_text.markdown("✅ Audio generation completed!")
+            eta_text.empty()
+
+            # ---- Display Files ----
+            for file_number, file_path in generated_files:
+                st.markdown(f"### 🎧 Part {file_number}")
+                st.audio(file_path, format="audio/mp3")
+
+                with open(file_path, "rb") as f:
+                    st.download_button(
+                        label=f"Download Part {file_number}",
+                        data=f,
+                        file_name=f"output_part_{file_number}.mp3",
+                        mime="audio/mpeg"
+                    )
 
         except Exception as e:
             st.error(f"Error generating audio: {e}")
