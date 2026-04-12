@@ -5,20 +5,25 @@ from openai import OpenAI
 import tempfile
 import math
 
-# Initialize OpenAI client using Streamlit secrets
-client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
+# ------------------ CONFIG ------------------
 
-st.set_page_config(page_title="Text/URL to MP3 (OpenAI TTS)", layout="centered")
-st.title("Text or URL to MP3 Converter (OpenAI TTS)")
-
-# ---- SETTINGS ----
 MODEL_NAME = "gpt-4o-mini-tts"
 VOICE = "alloy"
 
-# ⚠️ Update this if OpenAI pricing changes
-COST_PER_1K_CHARS = 0.015  # Example placeholder (adjust to current pricing)
+# ⚠️ Update if pricing changes
+COST_PER_1K_CHARS = 0.015  # USD per 1000 characters (approx)
 
-# ---- INPUT ----
+# Speech assumptions
+WORDS_PER_MINUTE = 160  # Average natural speech speed
+MAX_MINUTES_PER_FILE = 25
+
+client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
+
+st.set_page_config(page_title="Advanced Text to MP3", layout="centered")
+st.title("Text / URL to MP3 (OpenAI TTS)")
+
+# ------------------ INPUT ------------------
+
 option = st.radio("Choose input type:", ["Paste Text", "Enter URL"])
 text_content = ""
 
@@ -43,7 +48,8 @@ elif option == "Enter URL":
         except Exception as e:
             st.error(f"Error fetching URL: {e}")
 
-# ---- WORD COUNT & COST ESTIMATION ----
+# ------------------ ESTIMATION ------------------
+
 if text_content.strip():
 
     char_count = len(text_content)
@@ -51,55 +57,81 @@ if text_content.strip():
 
     estimated_cost = (char_count / 1000) * COST_PER_1K_CHARS
 
-    st.markdown("### 📊 Text Statistics")
-    col1, col2, col3 = st.columns(3)
+    estimated_minutes = word_count / WORDS_PER_MINUTE
+    estimated_hours = estimated_minutes / 60
+
+    number_of_files = math.ceil(estimated_minutes / MAX_MINUTES_PER_FILE)
+
+    st.markdown("### 📊 Estimated Overview")
+
+    col1, col2 = st.columns(2)
     col1.metric("Words", f"{word_count:,}")
     col2.metric("Characters", f"{char_count:,}")
-    col3.metric("Est. Cost (USD)", f"${estimated_cost:.4f}")
 
-    st.info("Cost is estimated based on character count. Actual cost may vary slightly.")
+    col3, col4 = st.columns(2)
+    col3.metric("Estimated Duration", f"{estimated_minutes:.1f} min (~{estimated_hours:.2f} hrs)")
+    col4.metric("Estimated Cost (USD)", f"${estimated_cost:.4f}")
 
-# ---- GENERATE AUDIO ----
-if st.button("Generate MP3"):
+    st.info(f"Audio will be split into approximately {number_of_files} file(s), each up to 25 minutes.")
 
-    if not text_content.strip():
-        st.warning("Please provide text or a valid URL.")
-    else:
+    confirm = st.checkbox("I confirm and want to generate the audio files")
+
+# ------------------ GENERATION ------------------
+
+if text_content.strip() and "confirm" in locals() and confirm:
+
+    if st.button("Generate Audio Files"):
+
         try:
-            with st.spinner("Generating MP3..."):
+            with st.spinner("Generating audio files..."):
 
-                # Chunk text safely (~4000 characters per request)
-                max_chars = 4000
-                chunks = [
-                    text_content[i:i + max_chars]
-                    for i in range(0, len(text_content), max_chars)
+                words = text_content.split()
+                words_per_file = WORDS_PER_MINUTE * MAX_MINUTES_PER_FILE
+
+                file_chunks = [
+                    " ".join(words[i:i + words_per_file])
+                    for i in range(0, len(words), words_per_file)
                 ]
 
-                final_audio = b""
+                generated_files = []
 
-                for chunk in chunks:
-                    response = client.audio.speech.create(
-                        model=MODEL_NAME,
-                        voice=VOICE,
-                        input=chunk
-                    )
-                    final_audio += response.content
+                for idx, chunk in enumerate(file_chunks):
 
-                tmp_mp3 = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
-                tmp_mp3.write(final_audio)
-                tmp_mp3.close()
+                    # Further safe chunking for API (~4000 chars)
+                    api_chunks = [
+                        chunk[i:i + 4000]
+                        for i in range(0, len(chunk), 4000)
+                    ]
 
-                st.success("✅ Audio generated successfully!")
+                    final_audio = b""
 
-                st.audio(tmp_mp3.name, format="audio/mp3")
+                    for part in api_chunks:
+                        response = client.audio.speech.create(
+                            model=MODEL_NAME,
+                            voice=VOICE,
+                            input=part
+                        )
+                        final_audio += response.content
 
-                with open(tmp_mp3.name, "rb") as f:
-                    st.download_button(
-                        label="Download MP3",
-                        data=f,
-                        file_name="output.mp3",
-                        mime="audio/mpeg"
-                    )
+                    tmp_mp3 = tempfile.NamedTemporaryFile(delete=False, suffix=".mp3")
+                    tmp_mp3.write(final_audio)
+                    tmp_mp3.close()
+
+                    generated_files.append((idx + 1, tmp_mp3.name))
+
+                st.success("✅ Audio files generated successfully!")
+
+                for file_number, file_path in generated_files:
+                    st.markdown(f"### 🎧 Part {file_number}")
+                    st.audio(file_path, format="audio/mp3")
+
+                    with open(file_path, "rb") as f:
+                        st.download_button(
+                            label=f"Download Part {file_number}",
+                            data=f,
+                            file_name=f"output_part_{file_number}.mp3",
+                            mime="audio/mpeg"
+                        )
 
         except Exception as e:
             st.error(f"Error generating audio: {e}")
