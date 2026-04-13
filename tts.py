@@ -18,12 +18,15 @@ VOICE = "alloy"
 
 WORDS_PER_MINUTE = 160
 MAX_MINUTES_PER_FILE = 25
-COST_PER_1K_CHARS = 0.015  # adjust if needed
+COST_PER_1K_CHARS = 0.015
 
 BASE_DIR = "jobs"
 os.makedirs(BASE_DIR, exist_ok=True)
 
 client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
+
+STUCK_TIMEOUT = 120
+MAX_RETRIES = 3
 
 # ---------------- STATE SAFETY ----------------
 
@@ -35,8 +38,10 @@ def normalize_state(state):
     state.setdefault("story_status", "not_started")
     state.setdefault("story_progress", 0)
     state.setdefault("story_started_at", None)
+    state.setdefault("story_last_heartbeat", None)
     state.setdefault("story_completed_at", None)
     state.setdefault("story_error", None)
+    state.setdefault("story_retry_count", 0)
     state.setdefault("story_title", "Indian_Story")
 
     return state
@@ -124,20 +129,23 @@ def generate_audio_job(job_id):
 def generate_story_job(job_id):
 
     state = load_state(job_id)
-    job_path = os.path.join(BASE_DIR, job_id)
 
-    state["story_status"] = "generating"
-    state["story_started_at"] = time.time()
-    state["story_progress"] = 10
-    save_state(job_id, state)
+    if state["story_retry_count"] >= MAX_RETRIES:
+        return
 
     try:
+        state["story_status"] = "generating"
+        state["story_started_at"] = time.time()
+        state["story_last_heartbeat"] = time.time()
+        state["story_progress"] = 5
+        save_state(job_id, state)
+
         original_text = state["text"]
 
         prompt = f"""
 Rewrite this story in Indian cultural context.
-Keep similar structure and emotional arc.
-Generate a suitable Indian title.
+Keep similar emotional arc and structure.
+Generate an Indian title.
 
 Return format:
 TITLE: <title>
@@ -148,19 +156,17 @@ Original:
 {original_text[:12000]}
 """
 
-        state["story_progress"] = 40
-        save_state(job_id, state)
-
         response = client.chat.completions.create(
             model=MODEL_TEXT,
             messages=[
-                {"role": "system", "content": "You are a skilled Indian fiction writer."},
+                {"role": "system", "content": "You are a skilled Indian novelist."},
                 {"role": "user", "content": prompt}
             ],
             temperature=0.8,
         )
 
         state["story_progress"] = 80
+        state["story_last_heartbeat"] = time.time()
         save_state(job_id, state)
 
         content = response.choices[0].message.content
@@ -171,18 +177,23 @@ Original:
         safe_title = "".join(c for c in title if c.isalnum() or c in " _-")
         state["story_title"] = safe_title
 
+        job_path = os.path.join(BASE_DIR, job_id)
         with open(os.path.join(job_path, f"{safe_title}.txt"), "w", encoding="utf-8") as f:
             f.write(story_text)
 
         state["story_progress"] = 100
         state["story_status"] = "completed"
         state["story_completed_at"] = time.time()
+        save_state(job_id, state)
 
     except Exception as e:
-        state["story_status"] = "failed"
+        state["story_retry_count"] += 1
         state["story_error"] = str(e)
+        state["story_status"] = "retrying"
+        save_state(job_id, state)
 
-    save_state(job_id, state)
+        time.sleep(3)
+        generate_story_job(job_id)
 
 
 # ---------------- UI ----------------
@@ -200,7 +211,7 @@ if menu == "Create Job":
     text_content = ""
 
     if input_type == "Paste Text":
-        text_content = st.text_area("Paste your text", height=250)
+        text_content = st.text_area("Paste text", height=250)
 
     else:
         url = st.text_input("Enter URL")
@@ -211,7 +222,7 @@ if menu == "Create Job":
                 for tag in soup(["script", "style"]):
                     tag.extract()
                 text_content = soup.get_text(separator=" ", strip=True)
-                st.success("Text extracted from URL.")
+                st.success("Text extracted.")
             except Exception as e:
                 st.error(f"URL Error: {e}")
 
@@ -221,9 +232,9 @@ if menu == "Create Job":
 
         st.markdown("### Estimate")
         st.write(f"Words: {words:,}")
-        st.write(f"Estimated Duration: {minutes:.1f} minutes")
-        st.write(f"Estimated Files (25 min each): {files}")
-        st.write(f"Estimated Cost (Audio): ${cost:.4f}")
+        st.write(f"Estimated Duration: {minutes:.1f} min")
+        st.write(f"Estimated Files: {files}")
+        st.write(f"Estimated Audio Cost: ${cost:.4f}")
 
         if st.button("Confirm & Start"):
 
@@ -244,7 +255,6 @@ if menu == "Create Job":
             threading.Thread(target=generate_story_job, args=(job_id,), daemon=True).start()
 
             st.success(f"Job started: {job_id}")
-            st.info("You can leave and return later.")
 
 
 # ---------------- VIEW JOBS ----------------
@@ -252,9 +262,6 @@ if menu == "Create Job":
 if menu == "View Jobs":
 
     jobs = os.listdir(BASE_DIR)
-
-    if not jobs:
-        st.info("No jobs found.")
 
     for job_id in jobs:
 
@@ -265,24 +272,30 @@ if menu == "View Jobs":
         st.markdown("---")
         st.markdown(f"### Job: {job_id}")
 
-        st.write(f"Audio Status: {state.get('status')}")
-        st.write(f"Audio Files: {state.get('completed_files')} / {state.get('total_files')}")
+        # ---- Stuck Detection ----
+        if state["story_status"] == "generating":
+            last = state.get("story_last_heartbeat")
+            if last and time.time() - last > STUCK_TIMEOUT:
+                state["story_status"] = "stuck"
+                save_state(job_id, state)
 
+        st.write(f"Audio Status: {state.get('status')}")
         st.write(f"Story Status: {state.get('story_status')}")
 
-        # Progress bar
-        progress = state.get("story_progress", 0)
-        st.progress(progress / 100)
+        st.progress(state.get("story_progress", 0) / 100)
 
-        # Live elapsed time
-        if state.get("story_status") == "generating":
+        if state["story_status"] == "generating":
             started = state.get("story_started_at")
             if started:
                 elapsed = (time.time() - started) / 60
-                st.info(f"Story running for {elapsed:.1f} minutes")
+                remaining = max((elapsed / max(state["story_progress"],1)) * (100 - state["story_progress"]), 0)
+                st.info(f"Elapsed: {elapsed:.1f} min | Est. Remaining: {remaining:.1f} min")
 
-        if state.get("story_status") == "failed":
-            st.error(f"Story Error: {state.get('story_error')}")
+        if state["story_status"] == "retrying":
+            st.warning(f"Retrying... Attempt {state['story_retry_count']}")
+
+        if state["story_status"] == "failed":
+            st.error(state.get("story_error"))
 
         job_path = os.path.join(BASE_DIR, job_id)
 
