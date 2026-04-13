@@ -25,19 +25,15 @@ os.makedirs(BASE_DIR, exist_ok=True)
 
 client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
 
-# ---------------- AUTO REFRESH (30s) ----------------
+# ---------------- AUTO REFRESH (30s SAFE) ----------------
 
 def auto_refresh():
-    st.markdown(
-        """
-        <script>
-        setTimeout(function(){
-            window.location.reload();
-        }, 30000);
-        </script>
-        """,
-        unsafe_allow_html=True,
-    )
+    if "last_refresh" not in st.session_state:
+        st.session_state.last_refresh = time.time()
+
+    if time.time() - st.session_state.last_refresh > 30:
+        st.session_state.last_refresh = time.time()
+        st.rerun()
 
 # ---------------- STATE SAFETY ----------------
 
@@ -81,7 +77,7 @@ def estimate_stats(text):
     cost = (char_count / 1000) * COST_PER_1K_CHARS
     return word_count, minutes, files, cost
 
-# ---------------- GENERIC AUDIO FUNCTION ----------------
+# ---------------- AUDIO GENERATOR ----------------
 
 def generate_audio_from_text(job_id, text, base_name, state_key):
 
@@ -95,6 +91,9 @@ def generate_audio_from_text(job_id, text, base_name, state_key):
         " ".join(words[i:i + words_per_file])
         for i in range(0, len(words), words_per_file)
     ]
+
+    state["total_files"] = len(chunks)
+    save_state(job_id, state)
 
     for i in range(state.get(state_key, 0), len(chunks)):
 
@@ -148,14 +147,20 @@ def generate_story_and_audio(job_id):
         save_state(job_id, state)
 
         prompt = f"""
-Rewrite this story in Indian cultural context.
-Keep similar emotional arc and structure.
-Generate a strong Indian title.
+Rewrite the following story in Indian cultural context.
 
-Return format:
-TITLE: <title>
+IMPORTANT:
+- The story MUST remain fully in English.
+- Do NOT translate into Hindi.
+- Use Indian names, locations, traditions.
+- Maintain similar plot structure and emotional arc.
+- Keep similar length.
+
+Return strictly:
+
+TITLE: <English title>
 STORY:
-<full story>
+<Full story in English>
 
 Original:
 {state["text"][:12000]}
@@ -166,7 +171,8 @@ Original:
             messages=[
                 {"role": "system", "content": "You are a skilled Indian fiction writer."},
                 {"role": "user", "content": prompt}
-            ]
+            ],
+            temperature=0.8,
         )
 
         content = response.choices[0].message.content
@@ -184,7 +190,6 @@ Original:
         state["story_status"] = "generating_audio"
         save_state(job_id, state)
 
-        # Generate MP3 for Indian story
         generate_audio_from_text(
             job_id,
             story_text,
@@ -196,7 +201,7 @@ Original:
         state["story_status"] = "completed"
         save_state(job_id, state)
 
-    except Exception as e:
+    except Exception:
         state["story_status"] = "failed"
         save_state(job_id, state)
 
@@ -235,9 +240,9 @@ if menu == "Create Job":
 
         st.markdown("### Estimate")
         st.write(f"Words: {words:,}")
-        st.write(f"Duration: {minutes:.1f} minutes")
-        st.write(f"Files: {files}")
-        st.write(f"Cost (Audio): ${cost:.4f}")
+        st.write(f"Estimated Duration: {minutes:.1f} minutes")
+        st.write(f"Estimated Files: {files}")
+        st.write(f"Estimated Audio Cost: ${cost:.4f}")
 
         if st.button("Confirm & Start"):
 
@@ -248,7 +253,10 @@ if menu == "Create Job":
                 "job_id": job_id,
                 "text": text_content,
                 "status": "queued",
-                "story_status": "queued"
+                "completed_files": 0,
+                "story_status": "queued",
+                "story_progress": 0,
+                "story_audio_completed": 0
             }
 
             save_state(job_id, state)
