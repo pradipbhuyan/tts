@@ -12,34 +12,32 @@ from openai import OpenAI
 
 # ---------------- CONFIG ----------------
 
-MODEL_NAME = "gpt-4o-mini-tts"
-TEXT_MODEL = "gpt-4o-mini"
+MODEL_TTS = "gpt-4o-mini-tts"
+MODEL_TEXT = "gpt-4o-mini"
 VOICE = "alloy"
 
 WORDS_PER_MINUTE = 160
 MAX_MINUTES_PER_FILE = 25
+COST_PER_1K_CHARS = 0.015  # adjust if needed
 
 BASE_DIR = "jobs"
 os.makedirs(BASE_DIR, exist_ok=True)
 
 client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
 
-# ---------------- STATE SAFETY LAYER ----------------
+# ---------------- STATE SAFETY ----------------
 
 def normalize_state(state):
-    """Ensure backward compatibility for old jobs."""
     state.setdefault("status", "unknown")
     state.setdefault("completed_files", 0)
     state.setdefault("total_files", 0)
 
     state.setdefault("story_status", "not_started")
+    state.setdefault("story_progress", 0)
     state.setdefault("story_started_at", None)
     state.setdefault("story_completed_at", None)
-    state.setdefault("story_title", None)
     state.setdefault("story_error", None)
-
-    state.setdefault("hindi_status", "not_requested")
-    state.setdefault("hindi_completed_files", 0)
+    state.setdefault("story_title", "Indian_Story")
 
     return state
 
@@ -62,48 +60,18 @@ def clean_job(job_id):
     shutil.rmtree(os.path.join(BASE_DIR, job_id), ignore_errors=True)
 
 
-# ---------------- AUDIO GENERATION ----------------
+# ---------------- ESTIMATION ----------------
 
-def generate_audio_from_text(job_id, text, base_name, state_key):
+def estimate_stats(text):
+    char_count = len(text)
+    word_count = len(text.split())
+    minutes = word_count / WORDS_PER_MINUTE
+    files = math.ceil(minutes / MAX_MINUTES_PER_FILE)
+    cost = (char_count / 1000) * COST_PER_1K_CHARS
+    return word_count, minutes, files, cost
 
-    job_path = os.path.join(BASE_DIR, job_id)
-    state = load_state(job_id)
 
-    words = text.split()
-    words_per_file = WORDS_PER_MINUTE * MAX_MINUTES_PER_FILE
-
-    file_chunks = [
-        " ".join(words[i:i + words_per_file])
-        for i in range(0, len(words), words_per_file)
-    ]
-
-    state["total_files"] = len(file_chunks)
-    save_state(job_id, state)
-
-    for file_index in range(state.get(state_key, 0), len(file_chunks)):
-
-        chunk = file_chunks[file_index]
-        api_chunks = [chunk[i:i + 4000] for i in range(0, len(chunk), 4000)]
-
-        final_audio = b""
-
-        for part in api_chunks:
-            response = client.audio.speech.create(
-                model=MODEL_NAME,
-                voice=VOICE,
-                input=part
-            )
-            final_audio += response.content
-
-        file_name = f"{base_name}_part_{file_index+1}.mp3"
-        file_path = os.path.join(job_path, file_name)
-
-        with open(file_path, "wb") as f:
-            f.write(final_audio)
-
-        state[state_key] = state.get(state_key, 0) + 1
-        save_state(job_id, state)
-
+# ---------------- AUDIO WORKER ----------------
 
 def generate_audio_job(job_id):
 
@@ -111,26 +79,56 @@ def generate_audio_job(job_id):
     state["status"] = "running"
     save_state(job_id, state)
 
-    generate_audio_from_text(
-        job_id,
-        state["text"],
-        base_name="Original_Audio",
-        state_key="completed_files"
-    )
+    job_path = os.path.join(BASE_DIR, job_id)
+    text = state["text"]
+
+    words = text.split()
+    words_per_file = WORDS_PER_MINUTE * MAX_MINUTES_PER_FILE
+
+    chunks = [
+        " ".join(words[i:i + words_per_file])
+        for i in range(0, len(words), words_per_file)
+    ]
+
+    state["total_files"] = len(chunks)
+    save_state(job_id, state)
+
+    for i in range(state["completed_files"], len(chunks)):
+
+        part_text = chunks[i]
+        api_chunks = [part_text[j:j+4000] for j in range(0, len(part_text), 4000)]
+
+        final_audio = b""
+
+        for piece in api_chunks:
+            response = client.audio.speech.create(
+                model=MODEL_TTS,
+                voice=VOICE,
+                input=piece
+            )
+            final_audio += response.content
+
+        filename = f"Original_part_{i+1}.mp3"
+        with open(os.path.join(job_path, filename), "wb") as f:
+            f.write(final_audio)
+
+        state["completed_files"] += 1
+        save_state(job_id, state)
 
     state["status"] = "completed"
     save_state(job_id, state)
 
 
-# ---------------- STORY + HINDI WORKER ----------------
+# ---------------- STORY WORKER ----------------
 
-def generate_indian_story_job(job_id, generate_hindi):
+def generate_story_job(job_id):
 
-    job_path = os.path.join(BASE_DIR, job_id)
     state = load_state(job_id)
+    job_path = os.path.join(BASE_DIR, job_id)
 
-    state["story_status"] = "running"
+    state["story_status"] = "generating"
     state["story_started_at"] = time.time()
+    state["story_progress"] = 10
     save_state(job_id, state)
 
     try:
@@ -138,81 +136,58 @@ def generate_indian_story_job(job_id, generate_hindi):
 
         prompt = f"""
 Rewrite this story in Indian cultural context.
-Generate a strong Indian title.
+Keep similar structure and emotional arc.
+Generate a suitable Indian title.
 
 Return format:
 TITLE: <title>
 STORY:
-<full rewritten story>
+<full story>
 
 Original:
 {original_text[:12000]}
 """
 
+        state["story_progress"] = 40
+        save_state(job_id, state)
+
         response = client.chat.completions.create(
-            model=TEXT_MODEL,
+            model=MODEL_TEXT,
             messages=[
-                {"role": "system", "content": "You are an expert Indian novelist."},
+                {"role": "system", "content": "You are a skilled Indian fiction writer."},
                 {"role": "user", "content": prompt}
             ],
             temperature=0.8,
         )
 
+        state["story_progress"] = 80
+        save_state(job_id, state)
+
         content = response.choices[0].message.content
 
-        title_line = content.split("\n")[0]
-        title = title_line.replace("TITLE:", "").strip()
+        title = content.split("\n")[0].replace("TITLE:", "").strip()
         story_text = content.split("STORY:", 1)[-1].strip()
 
         safe_title = "".join(c for c in title if c.isalnum() or c in " _-")
         state["story_title"] = safe_title
 
-        # Save story text
-        story_file = os.path.join(job_path, f"{safe_title}.txt")
-        with open(story_file, "w", encoding="utf-8") as f:
+        with open(os.path.join(job_path, f"{safe_title}.txt"), "w", encoding="utf-8") as f:
             f.write(story_text)
 
+        state["story_progress"] = 100
         state["story_status"] = "completed"
         state["story_completed_at"] = time.time()
-        save_state(job_id, state)
-
-        # -------- HINDI VERSION --------
-        if generate_hindi:
-
-            state["hindi_status"] = "translating"
-            save_state(job_id, state)
-
-            translate_prompt = f"Translate into natural Hindi:\n\n{story_text}"
-
-            response_hi = client.chat.completions.create(
-                model=TEXT_MODEL,
-                messages=[{"role": "user", "content": translate_prompt}],
-            )
-
-            hindi_story = response_hi.choices[0].message.content
-
-            state["hindi_status"] = "generating_audio"
-            save_state(job_id, state)
-
-            generate_audio_from_text(
-                job_id,
-                hindi_story,
-                base_name=f"{safe_title}_HINDI",
-                state_key="hindi_completed_files"
-            )
-
-            state["hindi_status"] = "completed"
-            save_state(job_id, state)
 
     except Exception as e:
         state["story_status"] = "failed"
         state["story_error"] = str(e)
-        save_state(job_id, state)
+
+    save_state(job_id, state)
 
 
 # ---------------- UI ----------------
 
-st.title("Advanced Persistent Audiobook Generator")
+st.title("Persistent Audiobook + Indian Story Generator")
 
 menu = st.sidebar.radio("Menu", ["Create Job", "View Jobs", "Clean Jobs"])
 
@@ -221,45 +196,55 @@ menu = st.sidebar.radio("Menu", ["Create Job", "View Jobs", "Clean Jobs"])
 
 if menu == "Create Job":
 
-    text_content = st.text_area("Paste Text", height=250)
-    generate_hindi = st.checkbox("Generate Hindi Audiobook Version")
+    input_type = st.radio("Input Type", ["Paste Text", "Enter URL"])
+    text_content = ""
+
+    if input_type == "Paste Text":
+        text_content = st.text_area("Paste your text", height=250)
+
+    else:
+        url = st.text_input("Enter URL")
+        if url:
+            try:
+                response = requests.get(url, timeout=10)
+                soup = BeautifulSoup(response.text, "html.parser")
+                for tag in soup(["script", "style"]):
+                    tag.extract()
+                text_content = soup.get_text(separator=" ", strip=True)
+                st.success("Text extracted from URL.")
+            except Exception as e:
+                st.error(f"URL Error: {e}")
 
     if text_content.strip():
 
-        estimated_minutes = len(text_content.split()) / WORDS_PER_MINUTE
-        st.write(f"Estimated Duration: {estimated_minutes:.1f} minutes")
+        words, minutes, files, cost = estimate_stats(text_content)
 
-        if st.button("Start Background Job"):
+        st.markdown("### Estimate")
+        st.write(f"Words: {words:,}")
+        st.write(f"Estimated Duration: {minutes:.1f} minutes")
+        st.write(f"Estimated Files (25 min each): {files}")
+        st.write(f"Estimated Cost (Audio): ${cost:.4f}")
+
+        if st.button("Confirm & Start"):
 
             job_id = str(uuid.uuid4())
-            job_path = os.path.join(BASE_DIR, job_id)
-            os.makedirs(job_path, exist_ok=True)
+            os.makedirs(os.path.join(BASE_DIR, job_id), exist_ok=True)
 
             state = {
                 "job_id": job_id,
                 "text": text_content,
                 "status": "queued",
                 "completed_files": 0,
-                "story_status": "queued",
-                "hindi_status": "queued" if generate_hindi else "not_requested"
+                "story_status": "queued"
             }
 
             save_state(job_id, state)
 
-            threading.Thread(
-                target=generate_audio_job,
-                args=(job_id,),
-                daemon=True
-            ).start()
-
-            threading.Thread(
-                target=generate_indian_story_job,
-                args=(job_id, generate_hindi),
-                daemon=True
-            ).start()
+            threading.Thread(target=generate_audio_job, args=(job_id,), daemon=True).start()
+            threading.Thread(target=generate_story_job, args=(job_id,), daemon=True).start()
 
             st.success(f"Job started: {job_id}")
-            st.info("You may leave and return later.")
+            st.info("You can leave and return later.")
 
 
 # ---------------- VIEW JOBS ----------------
@@ -281,11 +266,16 @@ if menu == "View Jobs":
         st.markdown(f"### Job: {job_id}")
 
         st.write(f"Audio Status: {state.get('status')}")
-        st.write(f"Story Status: {state.get('story_status')}")
-        st.write(f"Hindi Status: {state.get('hindi_status')}")
+        st.write(f"Audio Files: {state.get('completed_files')} / {state.get('total_files')}")
 
-        # ---- Live Elapsed Time ----
-        if state.get("story_status") == "running":
+        st.write(f"Story Status: {state.get('story_status')}")
+
+        # Progress bar
+        progress = state.get("story_progress", 0)
+        st.progress(progress / 100)
+
+        # Live elapsed time
+        if state.get("story_status") == "generating":
             started = state.get("story_started_at")
             if started:
                 elapsed = (time.time() - started) / 60
@@ -300,7 +290,7 @@ if menu == "View Jobs":
             if file.endswith(".mp3") or file.endswith(".txt"):
                 with open(os.path.join(job_path, file), "rb") as f:
                     st.download_button(
-                        label=f"Download {file}",
+                        f"Download {file}",
                         data=f,
                         file_name=file,
                         key=f"{job_id}_{file}"
@@ -313,18 +303,18 @@ if menu == "Clean Jobs":
 
     jobs = os.listdir(BASE_DIR)
 
-    if not jobs:
-        st.info("No jobs to delete.")
-    else:
+    if jobs:
         selected = st.selectbox("Select Job", jobs)
 
-        if st.button("Delete Selected Job"):
+        if st.button("Delete Selected"):
             clean_job(selected)
             st.success("Deleted.")
             st.rerun()
 
-        if st.button("Delete ALL Jobs"):
+        if st.button("Delete ALL"):
             for j in jobs:
                 clean_job(j)
-            st.success("All jobs deleted.")
+            st.success("All deleted.")
             st.rerun()
+    else:
+        st.info("No jobs available.")
