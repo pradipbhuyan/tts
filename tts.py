@@ -25,8 +25,19 @@ os.makedirs(BASE_DIR, exist_ok=True)
 
 client = OpenAI(api_key=st.secrets["OPENAI_API_KEY"])
 
-STUCK_TIMEOUT = 120
-MAX_RETRIES = 3
+# ---------------- AUTO REFRESH (30s) ----------------
+
+def auto_refresh():
+    st.markdown(
+        """
+        <script>
+        setTimeout(function(){
+            window.location.reload();
+        }, 30000);
+        </script>
+        """,
+        unsafe_allow_html=True,
+    )
 
 # ---------------- STATE SAFETY ----------------
 
@@ -37,12 +48,8 @@ def normalize_state(state):
 
     state.setdefault("story_status", "not_started")
     state.setdefault("story_progress", 0)
-    state.setdefault("story_started_at", None)
-    state.setdefault("story_last_heartbeat", None)
-    state.setdefault("story_completed_at", None)
-    state.setdefault("story_error", None)
-    state.setdefault("story_retry_count", 0)
-    state.setdefault("story_title", "Indian_Story")
+    state.setdefault("story_title", None)
+    state.setdefault("story_audio_completed", 0)
 
     return state
 
@@ -64,7 +71,6 @@ def load_state(job_id):
 def clean_job(job_id):
     shutil.rmtree(os.path.join(BASE_DIR, job_id), ignore_errors=True)
 
-
 # ---------------- ESTIMATION ----------------
 
 def estimate_stats(text):
@@ -75,17 +81,12 @@ def estimate_stats(text):
     cost = (char_count / 1000) * COST_PER_1K_CHARS
     return word_count, minutes, files, cost
 
+# ---------------- GENERIC AUDIO FUNCTION ----------------
 
-# ---------------- AUDIO WORKER ----------------
-
-def generate_audio_job(job_id):
+def generate_audio_from_text(job_id, text, base_name, state_key):
 
     state = load_state(job_id)
-    state["status"] = "running"
-    save_state(job_id, state)
-
     job_path = os.path.join(BASE_DIR, job_id)
-    text = state["text"]
 
     words = text.split()
     words_per_file = WORDS_PER_MINUTE * MAX_MINUTES_PER_FILE
@@ -95,14 +96,10 @@ def generate_audio_job(job_id):
         for i in range(0, len(words), words_per_file)
     ]
 
-    state["total_files"] = len(chunks)
-    save_state(job_id, state)
+    for i in range(state.get(state_key, 0), len(chunks)):
 
-    for i in range(state["completed_files"], len(chunks)):
-
-        part_text = chunks[i]
-        api_chunks = [part_text[j:j+4000] for j in range(0, len(part_text), 4000)]
-
+        chunk = chunks[i]
+        api_chunks = [chunk[j:j+4000] for j in range(0, len(chunk), 4000)]
         final_audio = b""
 
         for piece in api_chunks:
@@ -113,39 +110,47 @@ def generate_audio_job(job_id):
             )
             final_audio += response.content
 
-        filename = f"Original_part_{i+1}.mp3"
+        filename = f"{base_name}_part_{i+1}.mp3"
         with open(os.path.join(job_path, filename), "wb") as f:
             f.write(final_audio)
 
-        state["completed_files"] += 1
+        state[state_key] = state.get(state_key, 0) + 1
         save_state(job_id, state)
+
+# ---------------- ORIGINAL AUDIO WORKER ----------------
+
+def generate_original_audio(job_id):
+
+    state = load_state(job_id)
+    state["status"] = "running"
+    save_state(job_id, state)
+
+    generate_audio_from_text(
+        job_id,
+        state["text"],
+        "Original",
+        "completed_files"
+    )
 
     state["status"] = "completed"
     save_state(job_id, state)
 
+# ---------------- STORY + STORY AUDIO WORKER ----------------
 
-# ---------------- STORY WORKER ----------------
-
-def generate_story_job(job_id):
+def generate_story_and_audio(job_id):
 
     state = load_state(job_id)
-
-    if state["story_retry_count"] >= MAX_RETRIES:
-        return
+    job_path = os.path.join(BASE_DIR, job_id)
 
     try:
-        state["story_status"] = "generating"
-        state["story_started_at"] = time.time()
-        state["story_last_heartbeat"] = time.time()
-        state["story_progress"] = 5
+        state["story_status"] = "generating_story"
+        state["story_progress"] = 20
         save_state(job_id, state)
-
-        original_text = state["text"]
 
         prompt = f"""
 Rewrite this story in Indian cultural context.
 Keep similar emotional arc and structure.
-Generate an Indian title.
+Generate a strong Indian title.
 
 Return format:
 TITLE: <title>
@@ -153,21 +158,16 @@ STORY:
 <full story>
 
 Original:
-{original_text[:12000]}
+{state["text"][:12000]}
 """
 
         response = client.chat.completions.create(
             model=MODEL_TEXT,
             messages=[
-                {"role": "system", "content": "You are a skilled Indian novelist."},
+                {"role": "system", "content": "You are a skilled Indian fiction writer."},
                 {"role": "user", "content": prompt}
-            ],
-            temperature=0.8,
+            ]
         )
-
-        state["story_progress"] = 80
-        state["story_last_heartbeat"] = time.time()
-        save_state(job_id, state)
 
         content = response.choices[0].message.content
 
@@ -177,31 +177,34 @@ Original:
         safe_title = "".join(c for c in title if c.isalnum() or c in " _-")
         state["story_title"] = safe_title
 
-        job_path = os.path.join(BASE_DIR, job_id)
         with open(os.path.join(job_path, f"{safe_title}.txt"), "w", encoding="utf-8") as f:
             f.write(story_text)
 
+        state["story_progress"] = 60
+        state["story_status"] = "generating_audio"
+        save_state(job_id, state)
+
+        # Generate MP3 for Indian story
+        generate_audio_from_text(
+            job_id,
+            story_text,
+            safe_title,
+            "story_audio_completed"
+        )
+
         state["story_progress"] = 100
         state["story_status"] = "completed"
-        state["story_completed_at"] = time.time()
         save_state(job_id, state)
 
     except Exception as e:
-        state["story_retry_count"] += 1
-        state["story_error"] = str(e)
-        state["story_status"] = "retrying"
+        state["story_status"] = "failed"
         save_state(job_id, state)
-
-        time.sleep(3)
-        generate_story_job(job_id)
-
 
 # ---------------- UI ----------------
 
-st.title("Persistent Audiobook + Indian Story Generator")
+st.title("Audiobook + Indian Themed Story Generator")
 
 menu = st.sidebar.radio("Menu", ["Create Job", "View Jobs", "Clean Jobs"])
-
 
 # ---------------- CREATE JOB ----------------
 
@@ -223,8 +226,8 @@ if menu == "Create Job":
                     tag.extract()
                 text_content = soup.get_text(separator=" ", strip=True)
                 st.success("Text extracted.")
-            except Exception as e:
-                st.error(f"URL Error: {e}")
+            except:
+                st.error("Failed to fetch URL.")
 
     if text_content.strip():
 
@@ -232,9 +235,9 @@ if menu == "Create Job":
 
         st.markdown("### Estimate")
         st.write(f"Words: {words:,}")
-        st.write(f"Estimated Duration: {minutes:.1f} min")
-        st.write(f"Estimated Files: {files}")
-        st.write(f"Estimated Audio Cost: ${cost:.4f}")
+        st.write(f"Duration: {minutes:.1f} minutes")
+        st.write(f"Files: {files}")
+        st.write(f"Cost (Audio): ${cost:.4f}")
 
         if st.button("Confirm & Start"):
 
@@ -245,21 +248,21 @@ if menu == "Create Job":
                 "job_id": job_id,
                 "text": text_content,
                 "status": "queued",
-                "completed_files": 0,
                 "story_status": "queued"
             }
 
             save_state(job_id, state)
 
-            threading.Thread(target=generate_audio_job, args=(job_id,), daemon=True).start()
-            threading.Thread(target=generate_story_job, args=(job_id,), daemon=True).start()
+            threading.Thread(target=generate_original_audio, args=(job_id,), daemon=True).start()
+            threading.Thread(target=generate_story_and_audio, args=(job_id,), daemon=True).start()
 
             st.success(f"Job started: {job_id}")
-
 
 # ---------------- VIEW JOBS ----------------
 
 if menu == "View Jobs":
+
+    auto_refresh()
 
     jobs = os.listdir(BASE_DIR)
 
@@ -272,30 +275,9 @@ if menu == "View Jobs":
         st.markdown("---")
         st.markdown(f"### Job: {job_id}")
 
-        # ---- Stuck Detection ----
-        if state["story_status"] == "generating":
-            last = state.get("story_last_heartbeat")
-            if last and time.time() - last > STUCK_TIMEOUT:
-                state["story_status"] = "stuck"
-                save_state(job_id, state)
-
-        st.write(f"Audio Status: {state.get('status')}")
-        st.write(f"Story Status: {state.get('story_status')}")
-
-        st.progress(state.get("story_progress", 0) / 100)
-
-        if state["story_status"] == "generating":
-            started = state.get("story_started_at")
-            if started:
-                elapsed = (time.time() - started) / 60
-                remaining = max((elapsed / max(state["story_progress"],1)) * (100 - state["story_progress"]), 0)
-                st.info(f"Elapsed: {elapsed:.1f} min | Est. Remaining: {remaining:.1f} min")
-
-        if state["story_status"] == "retrying":
-            st.warning(f"Retrying... Attempt {state['story_retry_count']}")
-
-        if state["story_status"] == "failed":
-            st.error(state.get("story_error"))
+        st.write(f"Original Audio: {state['status']}")
+        st.write(f"Indian Story: {state['story_status']}")
+        st.progress(state["story_progress"] / 100)
 
         job_path = os.path.join(BASE_DIR, job_id)
 
@@ -304,11 +286,10 @@ if menu == "View Jobs":
                 with open(os.path.join(job_path, file), "rb") as f:
                     st.download_button(
                         f"Download {file}",
-                        data=f,
-                        file_name=file,
+                        f,
+                        file,
                         key=f"{job_id}_{file}"
                     )
-
 
 # ---------------- CLEAN JOBS ----------------
 
