@@ -3,7 +3,6 @@ import os
 import uuid
 import json
 import math
-import time
 import threading
 import requests
 from bs4 import BeautifulSoup
@@ -14,9 +13,11 @@ from openai import OpenAI
 MODEL_NAME = "gpt-4o-mini-tts"
 VOICE = "alloy"
 
+TEXT_MODEL = "gpt-4o-mini"
+
 WORDS_PER_MINUTE = 160
 MAX_MINUTES_PER_FILE = 25
-COST_PER_1K_CHARS = 0.015  # Update if pricing changes
+COST_PER_1K_CHARS = 0.015  # Adjust if pricing changes
 
 BASE_DIR = "jobs"
 os.makedirs(BASE_DIR, exist_ok=True)
@@ -47,7 +48,7 @@ def load_state(job_id):
     return None
 
 
-# ---------------- BACKGROUND WORKER ----------------
+# ---------------- AUDIO BACKGROUND WORKER ----------------
 
 def generate_audio_job(job_id):
 
@@ -97,11 +98,62 @@ def generate_audio_job(job_id):
     save_state(job_id, state)
 
 
+# ---------------- INDIAN STORY WORKER ----------------
+
+def generate_indian_story_job(job_id):
+
+    job_path = os.path.join(BASE_DIR, job_id)
+    state = load_state(job_id)
+
+    original_text = state["text"]
+
+    prompt = f"""
+Rewrite the following story in an Indian cultural context.
+
+Requirements:
+- Indian setting
+- Indian character names
+- Indian cultural elements
+- Maintain similar plot structure
+- Maintain emotional tone
+- Make it immersive and natural
+- Do NOT summarize — rewrite fully
+
+Original Story:
+{original_text[:12000]}
+"""
+
+    try:
+        response = client.chat.completions.create(
+            model=TEXT_MODEL,
+            messages=[
+                {"role": "system", "content": "You are a creative Indian fiction writer."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.8,
+        )
+
+        story_text = response.choices[0].message.content
+
+        file_path = os.path.join(job_path, "indian_story.txt")
+
+        with open(file_path, "w", encoding="utf-8") as f:
+            f.write(story_text)
+
+        state["story_status"] = "completed"
+
+    except Exception as e:
+        state["story_status"] = f"error: {str(e)}"
+
+    save_state(job_id, state)
+
+
 # ---------------- UI ----------------
 
-st.title("Persistent Text to Audiobook Generator")
+st.title("Persistent Audiobook + Indian Story Generator")
 
 menu = st.sidebar.radio("Menu", ["Create Job", "View Jobs"])
+
 
 # ---------------- CREATE JOB ----------------
 
@@ -116,12 +168,15 @@ if menu == "Create Job":
     else:
         url = st.text_input("Enter URL")
         if url:
-            response = requests.get(url)
-            soup = BeautifulSoup(response.text, "html.parser")
-            for tag in soup(["script", "style"]):
-                tag.extract()
-            text_content = soup.get_text(separator=" ", strip=True)
-            st.success("Text extracted")
+            try:
+                response = requests.get(url, timeout=10)
+                soup = BeautifulSoup(response.text, "html.parser")
+                for tag in soup(["script", "style"]):
+                    tag.extract()
+                text_content = soup.get_text(separator=" ", strip=True)
+                st.success("Text extracted")
+            except Exception as e:
+                st.error(f"Error fetching URL: {e}")
 
     if text_content.strip():
 
@@ -131,7 +186,7 @@ if menu == "Create Job":
         st.write(f"Words: {word_count:,}")
         st.write(f"Estimated Duration: {minutes:.1f} minutes")
         st.write(f"Estimated Files (25 min each): {files}")
-        st.write(f"Estimated Cost: ${cost:.4f}")
+        st.write(f"Estimated Cost (Audio Only): ${cost:.4f}")
 
         if st.button("Start Background Job"):
 
@@ -144,16 +199,30 @@ if menu == "Create Job":
                 "status": "running",
                 "completed_files": 0,
                 "total_files": 0,
+                "story_status": "running",
                 "text": text_content
             }
 
             save_state(job_id, state)
 
-            thread = threading.Thread(target=generate_audio_job, args=(job_id,))
-            thread.start()
+            audio_thread = threading.Thread(
+                target=generate_audio_job,
+                args=(job_id,),
+                daemon=True
+            )
+
+            story_thread = threading.Thread(
+                target=generate_indian_story_job,
+                args=(job_id,),
+                daemon=True
+            )
+
+            audio_thread.start()
+            story_thread.start()
 
             st.success(f"Job started! Job ID: {job_id}")
             st.info("You can safely refresh or return later.")
+
 
 # ---------------- VIEW JOBS ----------------
 
@@ -170,13 +239,23 @@ if menu == "View Jobs":
             if not state:
                 continue
 
-            st.markdown(f"---")
+            st.markdown("---")
             st.markdown(f"### Job: {job_id}")
-            st.write(f"Status: {state['status']}")
-            st.write(f"Completed Files: {state['completed_files']} / {state.get('total_files', '?')}")
+
+            st.write(f"Audio Status: {state['status']}")
+            st.write(
+                f"Completed Audio Files: "
+                f"{state['completed_files']} / {state.get('total_files', '?')}"
+            )
+
+            st.write(
+                f"Indian Story Status: "
+                f"{state.get('story_status', 'pending')}"
+            )
 
             job_path = os.path.join(BASE_DIR, job_id)
 
+            # Audio downloads
             for file in sorted(os.listdir(job_path)):
                 if file.endswith(".mp3"):
                     with open(os.path.join(job_path, file), "rb") as f:
@@ -187,3 +266,15 @@ if menu == "View Jobs":
                             mime="audio/mpeg",
                             key=f"{job_id}_{file}"
                         )
+
+            # Indian story download
+            story_file = os.path.join(job_path, "indian_story.txt")
+            if os.path.exists(story_file):
+                with open(story_file, "rb") as f:
+                    st.download_button(
+                        label="Download Indian Version Story",
+                        data=f,
+                        file_name="indian_story.txt",
+                        mime="text/plain",
+                        key=f"{job_id}_story"
+                    )
