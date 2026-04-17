@@ -136,7 +136,7 @@ def generate_original_audio(job_id):
     state["status"] = "completed"
     save_state(job_id, state)
 
-# ---------------- STORY + STORY AUDIO WORKER (FIXED) ----------------
+# ---------------- STORY + STORY AUDIO WORKER ----------------
 
 def generate_story_and_audio(job_id):
     state = load_state(job_id)
@@ -149,9 +149,9 @@ def generate_story_and_audio(job_id):
         state["story_progress"] = 10
         save_state(job_id, state)
 
-        # Use full original text (gpt-4o-mini supports 128k tokens; safe up to ~100k chars)
+        # Use full original text (safe limit)
         original_text = state["text"]
-        max_chars = 100000  # ~25k tokens, well within limit
+        max_chars = 100000
         if len(original_text) > max_chars:
             original_text = original_text[:max_chars] + "\n[TRUNCATED]"
 
@@ -194,7 +194,7 @@ Original:
 
         content = response.choices[0].message.content
 
-        # ---- Robust parsing ----
+        # Robust parsing
         title_match = re.search(r"TITLE:\s*(.+?)(?:\n|$)", content, re.IGNORECASE)
         story_match = re.search(r"STORY:\s*(.+?)$", content, re.DOTALL | re.IGNORECASE)
 
@@ -203,12 +203,11 @@ Original:
 
         # Validation
         if not story_text or len(story_text.split()) < 50:
-            raise ValueError(f"Generated story is too short or missing. Length: {len(story_text)} chars, words: {len(story_text.split())}")
+            raise ValueError(f"Generated story too short. Length: {len(story_text)} chars, words: {len(story_text.split())}")
 
         safe_title = "".join(c for c in title if c.isalnum() or c in " _-")
         state["story_title"] = safe_title
 
-        # Save story text
         with open(os.path.join(job_path, f"{safe_title}.txt"), "w", encoding="utf-8") as f:
             f.write(story_text)
 
@@ -216,7 +215,7 @@ Original:
         state["story_status"] = "generating_audio"
         save_state(job_id, state)
 
-        # ---- Step 2: Generate audio for the story ----
+        # ---- Step 2: Generate audio ----
         generate_audio_from_text(
             job_id,
             story_text,
@@ -234,12 +233,13 @@ Original:
         state["story_status"] = f"failed: {error_msg[:100]}"
         save_state(job_id, state)
 
-# ---------------- AUTO REFRESH (SAFE) ----------------
+# ---------------- AUTO REFRESH (30 SECONDS) ----------------
 
 def auto_refresh():
+    """Call this inside the View Jobs section to rerun every 30 seconds."""
     if "last_refresh" not in st.session_state:
         st.session_state.last_refresh = time.time()
-    if time.time() - st.session_state.last_refresh > 30:
+    if time.time() - st.session_state.last_refresh >= 30:
         st.session_state.last_refresh = time.time()
         st.rerun()
 
@@ -297,45 +297,57 @@ if menu == "Create Job":
 
             st.success(f"Job started: {job_id}")
 
-# ---------------- VIEW JOBS ----------------
+# ---------------- VIEW JOBS (with auto-refresh & unique keys) ----------------
 
 if menu == "View Jobs":
-    auto_refresh()
+    auto_refresh()   # <-- refreshes page every 30 seconds
+
     jobs = os.listdir(BASE_DIR)
 
-    for job_id in jobs:
-        state = load_state(job_id)
-        if not state:
-            continue
+    if not jobs:
+        st.info("No jobs yet. Create one from the sidebar.")
+    else:
+        for job_id in jobs:
+            state = load_state(job_id)
+            if not state:
+                continue
 
-        st.markdown("---")
-        st.markdown(f"### Job: {job_id}")
+            st.markdown("---")
+            st.markdown(f"### Job: {job_id}")
 
-        col1, col2 = st.columns(2)
-        col1.write(f"**Original Audio:** {state['status']}")
-        col2.write(f"**Indian Story:** {state['story_status']}")
+            col1, col2 = st.columns(2)
+            col1.write(f"**Original Audio:** {state['status']}")
+            col2.write(f"**Indian Story:** {state['story_status']}")
 
-        if "failed" in state["story_status"]:
-            st.error(f"Story generation failed: {state['story_status']}")
+            if "failed" in state["story_status"]:
+                st.error(f"Story generation failed: {state['story_status']}")
 
-        st.progress(state["story_progress"] / 100)
+            # Progress bar for story generation
+            st.progress(state["story_progress"] / 100)
 
-        job_path = os.path.join(BASE_DIR, job_id)
-        for file in os.listdir(job_path):
-            if file.endswith(".mp3") or file.endswith(".txt"):
-                with open(os.path.join(job_path, file), "rb") as f:
-                    st.download_button(
-                        f"Download {file}",
-                        f,
-                        file,
-                        key=f"{job_id}_{file}"
+            job_path = os.path.join(BASE_DIR, job_id)
+
+            # Download buttons for all files
+            for file in os.listdir(job_path):
+                if file.endswith(".mp3") or file.endswith(".txt"):
+                    with open(os.path.join(job_path, file), "rb") as f:
+                        st.download_button(
+                            f"Download {file}",
+                            f,
+                            file,
+                            key=f"download_{job_id}_{file}"   # unique key
+                        )
+
+            # Show error log if exists (with unique key)
+            error_log = os.path.join(job_path, "error.log")
+            if os.path.exists(error_log):
+                with open(error_log) as f:
+                    st.text_area(
+                        "Error Log (last 10 lines)",
+                        "\n".join(f.readlines()[-10:]),
+                        height=150,
+                        key=f"error_log_{job_id}"   # unique key per job
                     )
-
-        # Show error log if exists
-        error_log = os.path.join(job_path, "error.log")
-        if os.path.exists(error_log):
-            with open(error_log) as f:
-                st.text_area("Error Log (last 10 lines)", "\n".join(f.readlines()[-10:]), height=150)
 
 # ---------------- CLEAN JOBS ----------------
 
